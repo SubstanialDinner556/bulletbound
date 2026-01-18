@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Bulletbound</title>
+<style>
+body { margin:0; overflow:hidden; font-family:sans-serif; background:#111; color:white; }
+#menu {
+  position:absolute; top:0; left:0; width:100%; height:100%;
+  background: linear-gradient(#111,#000); display:flex;
+  justify-content:center; align-items:center; flex-direction:column;
+  color:white; font-size:32px; z-index:2;
+}
+.menu-row { margin:8px 0; font-size:18px; }
+button { margin:10px; padding:10px 20px; font-size:20px; cursor:pointer; }
+#overlay { position:absolute; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.7); z-index:4; }
+#gameOverPanel { position:absolute; z-index:6; text-align:center; color:white; }
+.upgrade-btn { margin:0 10px; padding:10px 18px; font-size:16px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="menu">
+  <div style="font-size:40px">BulletBound.io</div>
+  <div class="menu-row"><button id="startBtn">Start Game</button></div>
+  <div class="menu-row" id="greatestDisplay">Greatest High: -</div>
+</div>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/* ---------------------------
+   BASE GAME (kept intact)
+   plus requested final-boss cutscene & win screen
+   --------------------------- */
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// persistence for greatest level
+const STORAGE_KEY = 'survival_greatest_level';
+let greatestLevel = parseInt(localStorage.getItem(STORAGE_KEY) || '0', 10);
+document.getElementById('greatestDisplay').innerText = `Greatest Level: ${greatestLevel || '-'}`;
+
+// ----- Game Variables -----
+let gameStarted = false;
+let levelUpMenu = false;
+let upgradePending = false;
+let finalCutsceneActive = false;
+let finalDialogueIndex = 0;
+let finalDialogueTimer = 0;
+let finalDialogueLines = [
+  { speaker: 'boss', text: 'How long do u think it took me to gather all these minions?' },
+  { speaker: 'player', text: 'Like I care.. I beat them using only bullets.' },
+  { speaker: 'boss', text: '...' }
+];
+let expPickups = [];
+let gameOver = false;
+let elapsedSeconds = 0;
+let lastBossTime = 0;
+let swarmTextTimer = 0;
+let finalSequenceTriggered = false;
+let finalSequenceTimer = 0;
+let finalBossPhase = false;
+let finalTauntShown = false;
+let finalVictory = false;
+
+// screen shake
+let screenShakeTime = 0;
+let screenShakeIntensity = 0;
+
+// Difficulty scaling variables
+let spawnRate = 0.004;        // starts very slow
+const spawnRateMax = 0.06;
+let speedMultiplier = 1;
+const speedMultiplierMax = 2.0;
+let healthMultiplier = 1;
+const healthMultiplierMax = 3.0;
+
+// Player
+const player = {
+    x: canvas.width/2,
+    y: canvas.height/2,
+    size: 18,
+    color: 'lime',
+    speed: 4,
+    maxSpeed: 6,
+    health: 100,
+    maxHealth: 200,
+    damage: 10,
+    maxDamage: 50,
+    exp: 0,
+    level: 1,
+    bulletSize: 5,
+    bulletSpeed: 10,
+    maxBulletSize: 15,
+    maxBulletSpeed: 15,
+    spread: false,
+    spinningSwords: false,
+    boomerangUnlocked: false,
+    boomerangChance: 0.25,
+    boomerangChanceMax: 0.5,
+    pierce: false,
+    fireRate: 0.12,
+    lastShotTime: 0,
+    maxBullets: 600,
+    // track upgrade levels (0..4)
+    upgradeLevels: {
+        homing: 0,
+        frost: 0,
+        explosive: 0,
+        chain: 0,
+        swords: 0,
+        boomerang: 0,
+        laser: 0,
+        rapidfire: 0,
+        pierce: 0,
+        damage: 0,
+        bulletSpeed: 0
+    }
+};
+
+// Spinning sword upgrade stats
+player.swordSpeed = 2;
+player.swordMaxSpeed = 4;
+player.swordDamageMult = 1;
+player.swordMaxDamageMult = 3;
+player.swordKnockback = 1.2; // base knockback
+
+// New upgrade flags and stats
+player.homing = false;
+player.homingStrength = 0;
+player.homingLifetime = 2.5; // seconds
+player.frost = false;
+player.frostSlow = 0.5;
+player.frostFreezeChance = 0.18; // chance to fully freeze and slide
+player.explosive = false;
+player.explosiveRadius = 0;
+player.explosiveForce = 6;
+player.chainLevel = 0; // 0 none, up to 4
+player.chainRange = 0;
+player.chainDamageMult = 0.6;
+
+// Bullets
+let bullets = [];
+
+// Spinning Swords
+let spinningSwordsArr = [];
+
+// Particles & VFX
+let particles = []; // each has {x,y,vx,vy,life,type,extra}
+
+// Explosions array (for separate ring VFX)
+let explosions = [];
+
+// Enemies
+let enemies = [];
+function spawnEnemy(){
+    // block spawning while final boss (final) is alive
+    if(boss && boss.final && boss.alive) return;
+    const type = Math.random();
+    const size = 12 + Math.random()*8;
+    const baseSpeed = 0.6 + Math.random()*1.0;
+    const speed = Math.min(baseSpeed * speedMultiplier, 6);
+    const baseHealth = 12 + player.level*3;
+    const health = Math.max(6, Math.floor(baseHealth * healthMultiplier));
+    let e = {
+        x: Math.random()*canvas.width,
+        y: Math.random()*canvas.height,
+        size: size,
+        color: type<0.5?'red':type<0.85?'orange':'purple',
+        health: health,
+        maxHealth: health,
+        speed: speed,
+        exp: 10 + Math.floor(Math.random()*12),
+        flash: 0,
+        vx:0,
+        vy:0,
+        swordCooldown: 0,
+        slowTimer: 0,
+        slowFactor: 1,
+        frozen: false,
+        frozenTimer: 0
+    };
+    enemies.push(e);
+}
+
+// Boss
+let boss = null;
+let bossSpawned = false;
+let bossLevel = 1;
+function spawnBoss(final=false){
+    if(bossSpawned) return;
+    if(final){
+        // final boss with strong preset
+        boss = {
+            x: canvas.width/2,
+            y: 80,
+            size: 90,
+            color: 'crimson',
+            health: 1500,
+            maxHealth: 1500,
+            speed: 2,
+            damage: 30,
+            exp: 1500,
+            flash:0,
+            vx:0,
+            vy:0,
+            attackTimer:0,
+            alive: true,
+            final: true,
+            patternTimer: 0,
+            phase: 0
+        };
+    } else {
+        const base = 220 + player.level*50 + bossLevel*60;
+        boss = {
+            x: canvas.width/2,
+            y: 60,
+            size: 64,
+            color: 'magenta',
+            health: base,
+            maxHealth: base,
+            speed: Math.min(1 + player.level*0.2 + bossLevel*0.15, 6),
+            damage: 2 + bossLevel*0.8,
+            exp: 250 + player.level*60,
+            flash:0,
+            vx:0,
+            vy:0,
+            attackTimer:0,
+            alive: true,
+            final: false
+        };
+        bossLevel++;
+    }
+    bossSpawned = true;
+    lastBossTime = Date.now();
+}
+
+// Keys & Mouse
+let keys = {};
+document.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+document.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+let mouse = {x:0, y:0};
+canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+
+let mouseDown = false;
+canvas.addEventListener('mousedown', () => { mouseDown = true; });
+canvas.addEventListener('mouseup', () => { mouseDown = false; });
+
+/* --------------------------
+   SHOOTING / BULLET CREATION
+   -------------------------- */
+function handleShooting() {
+    if(!mouseDown || levelUpMenu || gameOver || finalCutsceneActive) return;
+    const now = Date.now() / 1000;
+    if(now - player.lastShotTime >= player.fireRate){
+        shootBullets();
+        player.lastShotTime = now;
+    }
+}
+
+function shootBullets() {
+    let angles = [Math.atan2(mouse.y - player.y, mouse.x - player.x)];
+    if(player.spread) angles = [angles[0]-0.22, angles[0], angles[0]+0.22];
+
+    angles.forEach(angle => {
+        // boomerang remains chance-based
+        const isBoomerang = player.boomerangUnlocked && (Math.random() < player.boomerangChance);
+        // homing chance depends on upgrade level
+        const homingLevel = player.upgradeLevels.homing || 0;
+        const homingChance = homingLevel > 0 ? 0.55 + homingLevel*0.1 : 0;
+        const willHome = player.homing && (Math.random() < homingChance);
+
+        // base bullet
+        bullets.push({
+            x: player.x,
+            y: player.y,
+            vx: Math.cos(angle) * player.bulletSpeed,
+            vy: Math.sin(angle) * player.bulletSpeed,
+            damage: player.damage,
+            size: player.bulletSize,
+            type: 'player',
+            homing: willHome,
+            life: willHome ? (player.homingLifetime || 2.5) : undefined,
+            flicker: false,
+            hitEnemies: [],
+            isBoomerang: isBoomerang,
+            returning: false,
+            returnedOnce: false,
+            bounces: isBoomerang ? 2 + (player.upgradeLevels.boomerang||0) : 0,
+            toRemove: false
+        });
+    });
+
+    if(bullets.length > player.maxBullets) bullets.splice(0, bullets.length - player.maxBullets);
+}
+
+/* --------------------------
+   UPGRADE SYSTEM (4 tiers)
+   -------------------------- */
+
+function getUpgradeChoices(){
+    // build list of upgrade definitions (id, name, apply function)
+    const pool = upgradesList.map(u => u); // copy
+    const choices = [];
+    while(choices.length < 3){
+        const pick = pool[Math.floor(Math.random()*pool.length)];
+        if(!choices.includes(pick)) choices.push(pick);
+    }
+    return choices;
+}
+
+function gainExp(amount){
+    player.exp += amount;
+    if(player.exp > maxExpCap) player.exp = maxExpCap;
+    if(player.exp >= maxExpCap && !upgradePending){
+        player.level++;
+        // update greatest level
+        if(player.level > greatestLevel){
+            greatestLevel = player.level;
+            localStorage.setItem(STORAGE_KEY, greatestLevel);
+            document.getElementById('greatestDisplay').innerText = `Greatest Level: ${greatestLevel}`;
+        }
+        player.exp = 0;
+        maxExpCap += 50;
+        upgradePending = true;
+        levelUpMenu = true;
+
+        // final level trigger
+        if(player.level >= 25 && !finalSequenceTriggered){
+            finalSequenceTriggered = true;
+            finalSequenceTimer = 3.2; // seconds until final boss spawn after taunt
+        }
+    }
+}
+
+let maxExpCap = 100;
+
+// list of upgrade definitions supporting 4-tier upgrades
+const upgradesList = [
+    { id:'damage', name:'Increase Damage', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.damage||0) + 1);
+        player.upgradeLevels.damage = lvl;
+        player.damage = Math.min(player.maxDamage, player.damage + 4 + lvl*2);
+    }},
+    { id:'bulletSpeed', name:'Faster Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.bulletSpeed||0) + 1);
+        player.upgradeLevels.bulletSpeed = lvl;
+        player.bulletSpeed = Math.min(player.maxBulletSpeed, player.bulletSpeed + 1 + lvl*0.8);
+    }},
+    { id:'bigger', name:'Bigger Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.bulletSize||0) + 1);
+        player.upgradeLevels.bulletSize = lvl;
+        player.bulletSize = Math.min(player.maxBulletSize, player.bulletSize + 1 + lvl*0.6);
+    }},
+    { id:'spread', name:'Spread Shot (early -> upgraded)', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.spread||0) + 1);
+        player.upgradeLevels.spread = lvl;
+        if(lvl >= 1) player.spread = true;
+        // higher levels widen spread and add extra projectiles
+        if(lvl === 2) player.spreadAngle = 0.26;
+        if(lvl === 3) player.spreadAngle = 0.32;
+        if(lvl === 4) { player.spreadAngle = 0.45; /* you keep spread true */ }
+    }},
+    { id:'rapid', name:'Rapid Fire', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.rapidfire||0) + 1);
+        player.upgradeLevels.rapidfire = lvl;
+        player.fireRate = Math.max(0.03, player.fireRate - 0.01 * lvl);
+    }},
+    { id:'pierce', name:'Piercing Shot', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.pierce||0) + 1);
+        player.upgradeLevels.pierce = lvl;
+        if(lvl >= 1) player.pierce = true;
+        // no. of enemies pierced ~ lvl
+    }},
+    { id:'laser', name:'Laser Beam', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.laser||0) + 1);
+        player.upgradeLevels.laser = lvl;
+        player.damage += 6 + lvl*3;
+    }},
+    { id:'homing', name:'Homing Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.homing||0) + 1);
+        player.upgradeLevels.homing = lvl;
+        player.homing = true;
+        player.homingStrength = 1.2 + lvl*0.2;
+        player.homingLifetime = 1.8 + lvl*0.5;
+    }},
+    { id:'frost', name:'Frost Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.frost||0) + 1);
+        player.upgradeLevels.frost = lvl;
+        player.frost = true;
+        player.frostSlow = Math.max(0.3, 0.6 - lvl*0.06);
+        player.frostFreezeChance = Math.min(0.5, 0.12 + lvl*0.06);
+    }},
+    { id:'explosive', name:'Explosive Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.explosive||0) + 1);
+        player.upgradeLevels.explosive = lvl;
+        player.explosive = true;
+        player.explosiveRadius = 20 + lvl*8;
+        player.explosiveForce = 4 + lvl*2;
+    }},
+    { id:'chain', name:'Chain Lightning', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.chain||0) + 1);
+        player.upgradeLevels.chain = lvl;
+        player.chainLevel = Math.min(4, lvl); // number of potential jumps
+        player.chainRange = 70 + lvl*13;
+    }},
+    { id:'swords', name:'Spinning Swords', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.swords||0) + 1);
+        player.upgradeLevels.swords = lvl;
+        if(!player.spinningSwords) player.spinningSwords = true;
+        player.swordSpeed = Math.min(player.swordMaxSpeed, 2 + lvl*0.6);
+        player.swordDamageMult = Math.min(player.swordMaxDamageMult, 1 + lvl*0.4);
+        player.swordKnockback = 1.2 + lvl*0.9; // stronger knockback per level
+    }},
+    { id:'boomerang', name:'Boomerang Bullets', apply: () => {
+        const lvl = Math.min(4, (player.upgradeLevels.boomerang||0) + 1);
+        player.upgradeLevels.boomerang = lvl;
+        if(!player.boomerangUnlocked) player.boomerangUnlocked = true;
+        player.boomerangChance = Math.min(player.boomerangChanceMax, 0.18 + lvl*0.14);
+    }}
+];
+
+// Legacy entries (kept for compatibility if user previously had them)
+const legacyDefaults = {}; // not used but kept
+
+/* --------------------------
+   OVERLAY / UPGRADE MENU
+   -------------------------- */
+function createOverlay() {
+    if(document.getElementById('overlay')) return;
+    let overlay = document.createElement('div');
+    overlay.id = 'overlay';
+    overlay.style.position = 'absolute';
+    overlay.style.top = '0';
+    overlay.style.left = '0';
+    overlay.style.width = '100%';
+    overlay.style.height = '100%';
+    overlay.style.background = 'rgba(0,0,0,0.7)';
+    overlay.style.zIndex = '4';
+    document.body.appendChild(overlay);
+}
+function removeOverlay() {
+    let overlay = document.getElementById('overlay');
+    if (overlay) document.body.removeChild(overlay);
+}
+function showUpgradeChoices(){
+    createOverlay();
+    let menu = document.createElement('div');
+    menu.id = 'upgradeMenu';
+    menu.style.position = 'absolute';
+    menu.style.top = '50%';
+    menu.style.left = '50%';
+    menu.style.transform = 'translate(-50%,-50%)';
+    menu.style.background = 'rgba(0,0,0,0.94)';
+    menu.style.padding = '16px';
+    menu.style.border = '2px solid white';
+    menu.style.display = 'flex';
+    menu.style.flexDirection = 'column';
+    menu.style.alignItems = 'center';
+    menu.style.zIndex = '6';
+    menu.style.minWidth = '420px';
+
+    let title = document.createElement('div');
+    title.innerText = 'Choose an Upgrade';
+    title.style.marginBottom = '14px';
+    title.style.fontSize = '22px';
+    menu.appendChild(title);
+
+    let buttonContainer = document.createElement('div');
+    buttonContainer.style.display = 'flex';
+    buttonContainer.style.justifyContent = 'center';
+    buttonContainer.style.gap = '12px';
+
+    let choices = getUpgradeChoices();
+
+    choices.forEach(up => {
+        let btn = document.createElement('button');
+        btn.className = 'upgrade-btn';
+        // show current level for that upgrade
+        const lvl = player.upgradeLevels[up.id] || 0;
+        btn.innerText = `${up.name} ${lvl>0 ? `(Lv ${lvl})` : '(Unlock)'}`;
+        btn.onclick = () => {
+            up.apply();
+            if(document.body.contains(menu)) document.body.removeChild(menu);
+            removeOverlay();
+            levelUpMenu = false;
+            upgradePending = false;
+        };
+        buttonContainer.appendChild(btn);
+    });
+
+    menu.appendChild(buttonContainer);
+    document.body.appendChild(menu);
+}
+
+/* --------------------------
+   HELPERS & VFX
+   -------------------------- */
+function distance(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+function spawnExplosion(x,y, radius=30, force=5, knockbackOnly=false){
+    // VFX ring (explosions[] will animate)
+    explosions.push({x,y,radius:0,maxRadius:radius,life:20});
+    // particle burst
+    for(let i=0;i<22;i++){
+        const ang = Math.random()*Math.PI*2;
+        const spd = Math.random()*3 + 1;
+        particles.push({x,y,vx:Math.cos(ang)*spd, vy:Math.sin(ang)*spd, life:30 + Math.random()*20, type:'explosion', size: Math.random()*3+2});
+    }
+    particles.push({x,y,vx:0,vy:0,life:12,type:'flash',size:radius});
+    // knockback to enemies
+    for(const en of enemies){
+        const d = Math.hypot(en.x - x, en.y - y);
+        if(d <= radius && d > 0){
+            const push = (1 - d / radius) * force;
+            const ang2 = Math.atan2(en.y - y, en.x - x);
+            en.vx += Math.cos(ang2) * push;
+            en.vy += Math.sin(ang2) * push;
+        }
+    }
+    if(boss && boss.alive){
+        const db = Math.hypot(boss.x - x, boss.y - y);
+        if(db <= radius && db > 0){
+            const push = (1 - db / radius) * force * 0.7;
+            const angb = Math.atan2(boss.y - y, boss.x - x);
+            boss.vx += Math.cos(angb) * push;
+            boss.vy += Math.sin(angb) * push;
+        }
+    }
+}
+
+function updateParticles(dt){
+    for(let i = particles.length - 1; i >= 0; i--){
+        const p = particles[i];
+        p.x += (p.vx || 0);
+        p.y += (p.vy || 0);
+        p.life -= (dt*60) || 1;
+        if(p.life <= 0) particles.splice(i,1);
+    }
+}
+function drawParticles(){
+    for(const p of particles){
+        if(p.type === 'explosion'){
+            ctx.globalAlpha = Math.max(0, Math.min(1, p.life/50));
+            ctx.beginPath();
+            ctx.arc(p.x,p.y,p.size,0,Math.PI*2);
+            ctx.fillStyle = 'orange';
+            ctx.fill();
+            ctx.globalAlpha = 1;
+        } else if(p.type === 'flash'){
+            ctx.globalAlpha = Math.max(0, Math.min(0.6, p.life/30));
+            ctx.fillStyle = 'rgba(255,200,80,0.6)';
+            ctx.beginPath();
+            ctx.arc(p.x,p.y,p.size,0,Math.PI*2);
+            ctx.fill();
+            ctx.globalAlpha = 1;
+        } else if(p.type === 'spark'){
+            ctx.globalAlpha = Math.max(0, Math.min(1, p.life/40));
+            ctx.fillStyle = 'yellow';
+            ctx.fillRect(p.x, p.y, 2, 2);
+            ctx.globalAlpha = 1;
+        } else if(p.type === 'magenta'){
+            ctx.globalAlpha = Math.max(0, Math.min(1, p.life/40));
+            ctx.fillStyle = 'magenta';
+            ctx.fillRect(p.x, p.y, 3, 3);
+            ctx.globalAlpha = 1;
+        } else if(p.type === 'ice'){
+            ctx.globalAlpha = Math.max(0, Math.min(1, p.life/40));
+            ctx.fillStyle = 'rgba(160,220,255,0.9)';
+            ctx.fillRect(p.x - 6, p.y - 6, 12, 12);
+            ctx.globalAlpha = 1;
+        } else if(p.type === 'ice-sickle'){
+            ctx.globalAlpha = Math.max(0, Math.min(1, p.life/40));
+            ctx.fillStyle = 'aqua';
+            ctx.fillRect(p.x, p.y, 4, 8);
+            ctx.globalAlpha = 1;
+        }
+    }
+}
+
+function updateExplosions(){
+    for(let i = explosions.length - 1; i >= 0; i--){
+        const e = explosions[i];
+        e.radius += (e.maxRadius / e.life) || 4;
+        e.life--;
+        if(e.life <= 0) explosions.splice(i,1);
+    }
+}
+function drawExplosions(){
+    for(const e of explosions){
+        ctx.strokeStyle = `rgba(255,180,60, ${Math.max(0, e.life/20)})`;
+        ctx.beginPath();
+        ctx.arc(e.x,e.y,e.radius,0,Math.PI*2);
+        ctx.stroke();
+    }
+}
+
+/* --------------------------
+   ATTACKS / DAMAGE
+   -------------------------- */
+function attackEnemy(en,dmg,kbX,kbY){
+    en.health -= dmg;
+    en.flash = 6;
+    en.vx += kbX;
+    en.vy += kbY;
+    for(let i=0;i<4;i++){
+        particles.push({x:en.x, y:en.y, vx:(Math.random()-0.5)*2, vy:(Math.random()-0.5)*2, life:30, type:'spark'});
+    }
+    if(en.health <=0){
+        gainExp(en.exp);
+        expPickups.push({x:en.x, y:en.y, radius:6, life:80, alpha:1, vy:-1});
+        enemies = enemies.filter(e=>e!==en);
+    }
+}
+
+function showFinalWin(){
+    // Pause the game and show YOU WON! panel
+    gameOver = true;
+    createOverlay();
+    const existing = document.getElementById('victoryPanel');
+    if(existing) existing.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'victoryPanel';
+    panel.style.left = '50%';
+    panel.style.top = '50%';
+    panel.style.transform = 'translate(-50%,-50%)';
+    panel.style.zIndex = '8';
+    panel.style.color = 'white';
+    panel.style.textAlign = 'center';
+    panel.style.background = 'rgba(0,0,0,0.95)';
+    panel.style.padding = '28px';
+    panel.style.border = '2px solid #fff';
+    panel.style.borderRadius = '10px';
+
+    const title = document.createElement('div');
+    title.style.fontSize = '48px';
+    title.style.color = 'gold';
+    title.style.marginBottom = '12px';
+    title.innerText = 'YOU WON!';
+    panel.appendChild(title);
+
+    const info = document.createElement('div');
+    info.style.marginBottom = '12px';
+    info.innerText = `Greatest Level: ${greatestLevel}`;
+    panel.appendChild(info);
+
+    const btn = document.createElement('button');
+    btn.innerText = 'Return to Main Menu';
+    btn.onclick = ()=> { location.reload(); };
+    panel.appendChild(btn);
+
+    document.body.appendChild(panel);
+}
+
+function attackBoss(dmg,kbX,kbY){
+    if(!boss) return;
+    boss.health -= dmg;
+    boss.flash = 8;
+    boss.vx += kbX;
+    boss.vy += kbY;
+    spawnExplosion(boss.x, boss.y, 28, 5, true);
+    screenShakeTime = Math.max(screenShakeTime, 0.25);
+    screenShakeIntensity = Math.max(screenShakeIntensity, 6);
+
+    for(let i=0;i<6;i++){
+        particles.push({x:boss.x + (Math.random()-0.5)*boss.size, y:boss.y + (Math.random()-0.5)*boss.size, vx:(Math.random()-0.5)*3, vy:(Math.random()-0.5)*3, life:40, type:'magenta'});
+    }
+
+    if(boss.health <=0){
+        // final vs normal boss behavior
+        if(boss.final){
+            // final boss defeated => victory
+            finalVictory = true;
+            finalBossPhase = false;
+            // big VFX
+            spawnExplosion(boss.x, boss.y, 80, 16, true);
+            screenShakeTime = Math.max(screenShakeTime, 0.9);
+            screenShakeIntensity = Math.max(screenShakeIntensity, 14);
+            boss.alive = false;
+            boss = null;
+            bossSpawned = false;
+            lastBossTime = Date.now();
+            // show YOU WON panel after short delay, then pause game
+            setTimeout(()=> showFinalWin(), 700);
+        } else {
+            gainExp(boss.exp);
+            expPickups.push({x:boss.x, y:boss.y, radius:10, life:110, alpha:1, vy:-1});
+            boss.alive = false;
+            boss = null;
+            bossSpawned = false;
+            lastBossTime = Date.now();
+        }
+    }
+}
+
+/* --------------------------
+   SPINNING SWORDS (with knockback)
+   -------------------------- */
+function updateSpinningSwords(){
+    if(!player.spinningSwords) return;
+    const swordCount = 6;
+    const radius = player.size + 22;
+    const angleOffset = Date.now() / (260 / Math.max(0.5, player.swordSpeed)); // rotation speed factor
+
+    for(let i=0; i<swordCount; i++){
+        const angle = i*(Math.PI*2/swordCount) + angleOffset;
+        const sword = {
+            x: player.x + Math.cos(angle)*radius,
+            y: player.y + Math.sin(angle)*radius,
+            size: 10,
+            damage: Math.max(1, Math.floor(player.damage * 0.35 * player.swordDamageMult))
+        };
+        spinningSwordsArr[i] = sword;
+    }
+
+    spinningSwordsArr.forEach(sword=>{
+        ctx.save();
+        ctx.translate(sword.x, sword.y);
+        ctx.rotate((Date.now()%3600)/1000);
+        ctx.fillStyle = 'cyan';
+        ctx.fillRect(-sword.size/2, -sword.size*1.4/2, sword.size, sword.size*1.4);
+        ctx.restore();
+
+        enemies.forEach(en=>{
+            if(en.swordCooldown && en.swordCooldown > 0) return;
+            if(distance(sword,en) < en.size + sword.size){
+                // apply stronger knockback scaled by swordKnockback
+                const k = player.swordKnockback || 1.2;
+                const ang = Math.atan2(en.y - player.y, en.x - player.x);
+                en.vx += Math.cos(ang) * (k * 1.8);
+                en.vy += Math.sin(ang) * (k * 1.8);
+                attackEnemy(en, sword.damage, 0, 0);
+                en.swordCooldown = 18; // faster sword cooldown
+            }
+        });
+        if(boss && distance(sword,boss) < boss.size + sword.size){
+            // knockback boss slightly
+            const angb = Math.atan2(boss.y - player.y, boss.x - player.x);
+            boss.vx += Math.cos(angb) * (player.swordKnockback * 1.2);
+            boss.vy += Math.sin(angb) * (player.swordKnockback * 1.2);
+            attackBoss(sword.damage, 0, 0);
+        }
+    });
+}
+
+/* --------------------------
+   GAME LOOP
+   -------------------------- */
+let prevTime = performance.now();
+
+function spawnFinalBossSequence(){
+    // wipe enemies
+    enemies = [];
+    bullets = [];
+    // show top taunt text for a few seconds (handled in loop by finalSequenceTimer)
+    finalTauntShown = false;
+    finalSequenceTimer = 3.2;
+    finalSequenceTriggered = true;
+}
+
+function scaleDifficultyPerSecond(){
+    spawnRate = Math.min(spawnRateMax, spawnRate + 0.000002);
+    speedMultiplier = Math.min(speedMultiplierMax, speedMultiplier + 0.00002);
+    healthMultiplier = Math.min(healthMultiplierMax, healthMultiplier + 0.00002);
+}
+
+function gameLoop(now = performance.now()){
+    if(!gameStarted) return;
+    if(gameOver) return;
+
+    // If upgrade menu open -> pause game visuals update but keep looping
+    if(levelUpMenu){
+        if(!document.getElementById('upgradeMenu')) showUpgradeChoices();
+        requestAnimationFrame(gameLoop);
+        return;
+    }
+
+    const dt = (now - prevTime) / 1000;
+    prevTime = now;
+    elapsedSeconds += dt;
+
+    // final sequence handling
+    if(finalSequenceTriggered && !finalBossPhase){
+        finalSequenceTimer -= dt;
+        if(finalSequenceTimer <= 2.2 && !finalTauntShown){
+            // show taunt top text for 2 seconds
+            finalTauntShown = true;
+            // freeze spawns until boss appears
+            enemies = [];
+        }
+        if(finalSequenceTimer <= 0){
+            finalBossPhase = true;
+            finalSequenceTriggered = false;
+
+            // clear battlefield
+            enemies = [];
+            bullets = [];
+            particles = [];
+            explosions = [];
+
+            player.maxHealth = Math.max(player.maxHealth, 500);
+            player.health = player.maxHealth;
+
+            spawnBoss(true);
+
+            // START CUTSCENE
+            finalCutsceneActive = true;
+            finalDialogueIndex = 0;
+            finalDialogueTimer = 0;
+        }
+    }
+
+    scaleDifficultyPerSecond();
+
+    // compute screen shake offsets
+    let shakeX = 0, shakeY = 0;
+    if(screenShakeTime > 0){
+        screenShakeTime -= dt;
+        const intensity = screenShakeIntensity;
+        shakeX = (Math.random()*2 - 1) * intensity;
+        shakeY = (Math.random()*2 - 1) * intensity;
+        if(screenShakeTime <= 0){
+            screenShakeTime = 0;
+            screenShakeIntensity = 0;
+        }
+    }
+
+    // start draw with translation for shake
+    ctx.save();
+    if(shakeX || shakeY) ctx.translate(shakeX, shakeY);
+
+    // Background
+    let bgGradient = ctx.createLinearGradient(0,0,0,canvas.height);
+    bgGradient.addColorStop(0,'#0a0a0a');
+    bgGradient.addColorStop(1,'#111');
+    ctx.fillStyle = bgGradient;
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    // Boss timer / final boss health display
+    if(finalBossPhase && boss && boss.alive){
+        ctx.fillStyle = 'white';
+        ctx.font = '20px Arial';
+        ctx.fillText(`Final Boss HP: ${Math.max(0, Math.floor(boss.health))}`, canvas.width/2 - 120, 28);
+    } else {
+        let nextBossIn = Math.max(0, 120 - Math.floor((Date.now()-lastBossTime)/1000));
+        ctx.fillStyle = 'white';
+        ctx.font = '20px Arial';
+        ctx.fillText(`Next Boss In: ${nextBossIn}s`, canvas.width-200, 30);
+    }
+
+    // display final taunt text if in final sequence pre-boss
+    if(finalSequenceTriggered && finalTauntShown){
+        ctx.fillStyle = 'white';
+        ctx.font = '30px Arial';
+        ctx.fillText('You may have won.... but you wont beat me..', canvas.width/2 - 360, 80);
+    }
+
+    // Player movement (disabled during final cutscene)
+    if(!finalCutsceneActive){
+        let dx=0, dy=0;
+        if(keys['w']) dy -= player.speed;
+        if(keys['s']) dy += player.speed;
+        if(keys['a']) dx -= player.speed;
+        if(keys['d']) dx += player.speed;
+        player.x = Math.max(player.size, Math.min(canvas.width-player.size, player.x+dx));
+        player.y = Math.max(player.size, Math.min(canvas.height-player.size, player.y+dy));
+    }
+
+    // Shooting
+    handleShooting();
+
+    // ----- Update bullets -----
+    for(let i = bullets.length - 1; i >= 0; i--){
+        let b = bullets[i];
+
+        // HOMING steering (only player bullets)
+        if(b.type === 'player' && b.homing && player.homing && !b.returning){
+            const targets = enemies.slice();
+            if(boss && boss.alive && !b.hitEnemies.includes(boss)) targets.push(boss);
+            if(targets.length > 0){
+                // find nearest
+                let nearest = targets.reduce((a,c)=> distance(b,a) < distance(b,c) ? a : c, targets[0]);
+                let ang = Math.atan2(nearest.y - b.y, nearest.x - b.x);
+                let spd = Math.hypot(b.vx, b.vy) || player.bulletSpeed;
+                const steer = 0.06 * (player.homingStrength || 1.5);
+                b.vx += (Math.cos(ang)*spd - b.vx) * steer;
+                b.vy += (Math.sin(ang)*spd - b.vy) * steer;
+            }
+            // lifetime decrement
+            b.life -= dt;
+            if(b.life <= 0){
+                // flicker removal: spawn a few sparks and have chance to explode
+                for(let k=0;k<8;k++) particles.push({x:b.x, y:b.y, vx:(Math.random()-0.5)*2.5, vy:(Math.random()-0.5)*2.5, life:22, type:'spark'});
+                if(player.explosive && Math.random() < 0.35){
+                    const r = player.explosiveRadius || 36;
+                    spawnExplosion(b.x, b.y, r, player.explosiveForce || 6, true);
+                } else if(Math.random() < 0.22){ // homing flicker explode chance even if not explosive upgrade
+                    const r = 30;
+                    spawnExplosion(b.x, b.y, r, 5, true);
+                }
+                b.toRemove = true;
+            }
+        }
+
+        b.x += b.vx;
+        b.y += b.vy;
+        let hitSomething = false;
+
+        // check enemies collisions
+        for(let enIndex = enemies.length-1; enIndex >= 0; enIndex--){
+            const en = enemies[enIndex];
+            if(b.hitEnemies.includes(en)) continue;
+            if(distance(b,en) < b.size + en.size){
+                // damage
+                let dmg = b.damage;
+
+                // FROST: chance to freeze fully, otherwise apply slow
+                if(player.frost && b.type==='player'){
+                    const freezeChance = player.frostFreezeChance || 0.12;
+                    if(Math.random() < freezeChance){
+                        en.frozen = true;
+                        en.frozenTimer = 0.9 + (player.upgradeLevels.frost||0)*0.2;
+                        const pushSpeed = 6 + (player.upgradeLevels.frost||0);
+                        const ang = Math.atan2(b.vy, b.vx);
+                        en.vx = Math.cos(ang) * pushSpeed;
+                        en.vy = Math.sin(ang) * pushSpeed;
+                        particles.push({x:en.x, y:en.y, vx:0, vy:0, life:32, type:'ice'});
+                    } else {
+                        en.slowTimer = 1.4 + (player.upgradeLevels.frost||0)*0.2;
+                        en.slowFactor = player.frostSlow || 0.5;
+                        particles.push({x:en.x, y:en.y - en.size - 6, vx:0, vy:0, life:30, type:'ice-sickle'});
+                    }
+                }
+
+                attackEnemy(en, dmg, b.vx*0.2, b.vy*0.2);
+                b.hitEnemies.push(en);
+                hitSomething = true;
+
+                // EXPLOSIVE splash (player upgrade)
+                if(player.explosive && b.type==='player'){
+                    const radius = player.explosiveRadius || 30;
+                    spawnExplosion(b.x, b.y, radius, player.explosiveForce || 6, true);
+                    for(const aoe of enemies.slice()){
+                        const d = Math.hypot(aoe.x - b.x, aoe.y - b.y);
+                        if(d < radius && !b.hitEnemies.includes(aoe)){
+                            const splashDmg = Math.floor(dmg * 0.6);
+                            attackEnemy(aoe, splashDmg, 0, 0);
+                            b.hitEnemies.push(aoe);
+                        }
+                    }
+                    if(boss && boss.alive && distance(b,boss) < radius && !b.hitEnemies.includes(boss)){
+                        const splashDmg = Math.floor(dmg * 0.6);
+                        attackBoss(splashDmg, 0, 0);
+                        const angb = Math.atan2(boss.y - b.y, boss.x - b.x);
+                        boss.vx += Math.cos(angb) * 4;
+                        boss.vy += Math.sin(angb) * 4;
+                        b.hitEnemies.push(boss);
+                    }
+                }
+
+                // CHAIN LIGHTNING
+                if(player.chainLevel > 0 && b.type==='player'){
+                    const chainRange = player.chainRange || 80;
+                    const jumps = Math.max(1, player.chainLevel);
+                    let from = en;
+                    let used = new Set([en]);
+                    for(let j=0;j<jumps;j++){
+                        const nearby = enemies.filter(e2 => !used.has(e2) && distance(e2, from) < chainRange);
+                        if(nearby.length === 0) break;
+                        const target = nearby[Math.floor(Math.random()*nearby.length)];
+                        const chainDmg = Math.max(1, Math.floor(dmg * player.chainDamageMult));
+                        attackEnemy(target, chainDmg, 0, 0);
+                        ctx.strokeStyle = 'cyan';
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.moveTo(from.x, from.y);
+                        ctx.lineTo(target.x, target.y);
+                        ctx.stroke();
+                        ctx.lineWidth = 1;
+                        used.add(target);
+                        from = target;
+                    }
+                }
+
+                // boomerang behavior
+                if(b.isBoomerang){
+                    b.bounces = Math.max(0, b.bounces - 1);
+                    if(b.bounces > 0){
+                        const others = enemies.filter(x=>x!==en);
+                        if(boss && boss.alive && !b.hitEnemies.includes(boss)) others.push(boss);
+                        if(others.length > 0){
+                            const target = others[Math.floor(Math.random()*others.length)];
+                            const ang = Math.atan2(target.y - b.y, target.x - b.x);
+                            const sp = Math.hypot(b.vx, b.vy) || player.bulletSpeed*0.6;
+                            b.vx = Math.cos(ang) * Math.max(2, sp);
+                            b.vy = Math.sin(ang) * Math.max(2, sp);
+                        } else {
+                            b.returning = true;
+                            b.returnedOnce = true;
+                        }
+                    } else {
+                        if(!b.returnedOnce){
+                            b.returning = true;
+                            b.returnedOnce = true;
+                        } else {
+                            b.toRemove = true;
+                        }
+                    }
+                } else {
+                    if(!player.pierce){
+                        b.toRemove = true;
+                    }
+                }
+
+                break;
+            }
+        }
+
+        // check boss safely (works for final boss too)
+        if(boss && boss.alive && !b.hitEnemies.includes(boss) && distance(b,boss) < b.size + boss.size){
+            // If cutscene active, ignore any bullet hitting boss (we prevent shooting during cutscene, but keep safe)
+            if(finalCutsceneActive){
+                // ignore collisions while cutscene active
+            } else {
+                attackBoss(b.damage, b.vx*0.2, b.vy*0.2);
+                b.hitEnemies.push(boss);
+                hitSomething = true;
+
+                // boomerang with boss
+                if(b.isBoomerang){
+                    b.bounces = Math.max(0, b.bounces - 1);
+                    if(b.bounces > 0){
+                        const others = enemies.slice();
+                        if(others.length > 0){
+                            const target = others[Math.floor(Math.random()*others.length)];
+                            const ang = Math.atan2(target.y - b.y, target.x - b.x);
+                            const sp = Math.hypot(b.vx, b.vy) || player.bulletSpeed*0.6;
+                            b.vx = Math.cos(ang) * Math.max(2, sp);
+                            b.vy = Math.sin(ang) * Math.max(2, sp);
+                        } else {
+                            b.returning = true;
+                            b.returnedOnce = true;
+                        }
+                    } else {
+                        if(!b.returnedOnce){
+                            b.returning = true;
+                            b.returnedOnce = true;
+                        } else {
+                            b.toRemove = true;
+                        }
+                    }
+                } else {
+                    if(!player.pierce) b.toRemove = true;
+                }
+            }
+        }
+
+        // Boomerang returning
+        if(b.isBoomerang && b.returning){
+            const ang = Math.atan2(player.y - b.y, player.x - b.x);
+            const spd = player.bulletSpeed * 0.62;
+            b.vx = Math.cos(ang) * spd;
+            b.vy = Math.sin(ang) * spd;
+            if(Math.hypot(b.x - player.x, b.y - player.y) < player.size + 4){
+                b.toRemove = true;
+            }
+        } else if(b.isBoomerang && !b.returning){
+            const distToPlayer = Math.hypot(b.x - player.x, b.y - player.y);
+            if(!hitSomething && distToPlayer > 420 && !b.returnedOnce){
+                b.returning = true;
+                b.returnedOnce = true;
+            }
+        } else {
+            if(!b.isBoomerang && (b.x < -50 || b.x > canvas.width + 50 || b.y < -50 || b.y > canvas.height + 50)){
+                b.toRemove = true;
+            }
+        }
+    }
+
+    // Remove bullets
+    bullets = bullets.filter(b => !b.toRemove);
+
+    // ----- Draw bullets -----
+    for(const b of bullets){
+        // homing flicker if removing soon
+        if(b.homing && b.life !== undefined && b.life < 0.4){
+            // flicker: draw only half frames for effect
+            if(Math.floor(elapsedSeconds*20) % 2 === 0) continue;
+            ctx.globalAlpha = 0.6 + 0.4 * (b.life / 0.4);
+        }
+        ctx.fillStyle = b.isBoomerang ? 'orange' : (b.type === 'enemy' ? 'pink' : 'yellow');
+        ctx.beginPath();
+        ctx.arc(b.x,b.y,b.size,0,Math.PI*2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+
+    // Update & draw particles and explosions
+    updateParticles(dt);
+    updateExplosions();
+    drawParticles();
+    drawExplosions();
+
+    // ----- Spinning Swords -----
+    enemies.forEach(en=>{ 
+        if(en.swordCooldown && en.swordCooldown>0) en.swordCooldown--;
+        if(en.slowTimer && en.slowTimer > 0){
+            en.slowTimer -= dt;
+            if(en.slowTimer <= 0){
+                en.slowFactor = 1;
+                en.slowTimer = 0;
+            }
+        }
+        if(en.frozen && en.frozenTimer > 0){
+            en.frozenTimer -= dt;
+            if(en.frozenTimer <= 0){
+                en.frozen = false;
+                en.frozenTimer = 0;
+            }
+        }
+    });
+    updateSpinningSwords();
+
+    // ----- Enemy AI -----
+    for(let i = enemies.length-1; i >= 0; i--){
+        const en = enemies[i];
+
+        if(en.frozen){
+            // slide by velocity while frozen; allow collisions with other enemies to push them
+            en.x += en.vx;
+            en.y += en.vy;
+            // friction
+            en.vx *= 0.98;
+            en.vy *= 0.98;
+            // push others if colliding
+            for(const other of enemies){
+                if(other === en) continue;
+                if(distance(en, other) < en.size + other.size){
+                    const ang = Math.atan2(other.y - en.y, other.x - en.x);
+                    other.vx += Math.cos(ang) * 2.5;
+                    other.vy += Math.sin(ang) * 2.5;
+                }
+            }
+        } else {
+            let moveSpeed = en.speed * (en.slowTimer > 0 ? en.slowFactor : 1);
+            let angle = Math.atan2(player.y-en.y, player.x-en.x);
+            en.x += Math.cos(angle)*moveSpeed + en.vx;
+            en.y += Math.sin(angle)*moveSpeed + en.vy;
+            en.vx *=0.8; en.vy*=0.8;
+        }
+
+        // collision with player
+        if(distance(player,en) < player.size + en.size){
+            player.health -= 0.5 + (en.maxHealth/100);
+            en.vx += (Math.random()-0.5)*2;
+            en.vy += (Math.random()-0.5)*2;
+            if(player.health <= 0){
+                player.health = 0;
+                gameOver = true;
+                showGameOverPanel();
+                ctx.restore();
+                return;
+            }
+        }
+
+        // draw enemy (ice cube if frozen)
+        if(en.frozen){
+            ctx.fillStyle = 'rgba(160,220,255,0.9)';
+            ctx.fillRect(en.x - en.size - 3, en.y - en.size - 3, (en.size+3)*2, (en.size+3)*2);
+            ctx.fillStyle = en.flash>0 ? 'white' : en.color;
+            ctx.beginPath();
+            ctx.arc(en.x,en.y,en.size,0,Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = 'aqua';
+            ctx.fillRect(en.x - 2, en.y - en.size - 14, 4, 8);
+        } else {
+            ctx.fillStyle = en.flash>0 ? 'white' : en.color;
+            ctx.beginPath();
+            ctx.arc(en.x,en.y,en.size,0,Math.PI*2);
+            ctx.fill();
+        }
+        if(en.flash>0) en.flash--;
+
+        // enemy health bar
+        ctx.fillStyle = 'rgba(255,0,0,0.8)';
+        ctx.fillRect(en.x - en.size, en.y - en.size - 8, en.size*2, 5);
+        ctx.fillStyle = 'lime';
+        ctx.fillRect(en.x - en.size, en.y - en.size - 8, en.size*2 * Math.max(0, en.health/en.maxHealth), 5);
+    }
+
+    // chance to spawn enemies (blocked while final final boss alive)
+    if(Math.random() < spawnRate){
+        if(!(boss && boss.final && boss.alive)) spawnEnemy();
+    }
+
+    // fewer swarms early
+    if(Math.random() < 0.00015 + (elapsedSeconds/50000)){
+        if(!(boss && boss.final && boss.alive)){
+            const count = 6 + Math.floor(Math.random()*7);
+            for(let i=0;i<count;i++) spawnEnemy();
+            swarmTextTimer = 80;
+        }
+    }
+
+    // ----- Boss AI & Draw -----
+    if(boss && boss.alive){
+        // If final cutscene active, boss must remain still and not attack
+        if(boss.final && finalCutsceneActive){
+            // just draw boss (no movement/attacks)
+            ctx.fillStyle = boss.flash>0 ? 'white' : boss.color;
+            ctx.beginPath();
+            ctx.arc(boss.x,boss.y,boss.size,0,Math.PI*2);
+            ctx.fill();
+            boss.flash = Math.max(0, boss.flash-1);
+
+            // boss health bar above boss
+            const hbW = boss.size*2;
+            ctx.fillStyle = 'rgba(200,0,0,0.9)';
+            ctx.fillRect(boss.x - boss.size, boss.y - boss.size - 12, hbW, 8);
+            ctx.fillStyle = boss.final ? 'red' : 'magenta';
+            ctx.fillRect(boss.x - boss.size, boss.y - boss.size - 12, hbW * Math.max(0, (boss.health / boss.maxHealth)), 8);
+
+            // Dialogue handling (cutscene)
+            if(finalCutsceneActive){
+                finalDialogueTimer += dt;
+                // show each line for 2.2s
+                const lineDuration = 2.2;
+                if(finalDialogueTimer >= lineDuration){
+                    finalDialogueIndex++;
+                    finalDialogueTimer = 0;
+                }
+                // if finished dialogue, end cutscene
+                if(finalDialogueIndex >= finalDialogueLines.length){
+                    finalCutsceneActive = false;
+                    finalDialogueIndex = 0;
+                    finalDialogueTimer = 0;
+                } else {
+                    // draw dialogue box
+                    const dd = finalDialogueLines[finalDialogueIndex];
+                    const boxW = Math.min(900, canvas.width - 120);
+                    const boxH = 80;
+                    const bx = (canvas.width - boxW)/2;
+                    const by = canvas.height - 140;
+                    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+                    ctx.fillRect(bx, by, boxW, boxH);
+                    ctx.strokeStyle = 'white';
+                    ctx.strokeRect(bx, by, boxW, boxH);
+                    ctx.fillStyle = 'white';
+                    ctx.font = '20px Arial';
+                    const speaker = dd.speaker === 'boss' ? 'Boss' : 'You';
+                    ctx.fillText(`${speaker}: ${dd.text}`, bx + 14, by + 44);
+                }
+            }
+        } else {
+            // regular boss AI (final boss after cutscene or normal boss)
+            if(boss.final){
+                boss.patternTimer += dt;
+                // phase switching
+                if(boss.patternTimer > 5){
+                    boss.phase = (boss.phase + 1) % 3;
+                    boss.patternTimer = 0;
+                }
+                // movement towards player but more deliberate
+                let angle = Math.atan2(player.y-boss.y, player.x-boss.x);
+                boss.x += Math.cos(angle)*boss.speed + boss.vx;
+                boss.y += Math.sin(angle)*boss.speed + boss.vy;
+                boss.vx *= 0.82; boss.vy *= 0.82;
+
+                // pattern attacks
+                boss.attackTimer += dt;
+                if(boss.phase === 0 && boss.attackTimer > 1.8){
+                    // radial burst
+                    for(let k=0;k<10;k++){
+                        let a = (k/10) * Math.PI*2 + Math.random()*0.2;
+                        bullets.push({
+                            x: boss.x, y: boss.y,
+                            vx: Math.cos(a)*4.5, vy: Math.sin(a)*4.5,
+                            damage: Math.max(4, Math.floor(boss.damage)),
+                            size:6, type:'enemy', hitEnemies:[], isBoomerang:false, returning:false, returnedOnce:false, toRemove:false
+                        });
+                    }
+                    boss.attackTimer = 0;
+                } else if(boss.phase === 1 && boss.attackTimer > 2.4){
+                    // targeted volleys at player
+                    for(let k=0;k<5;k++){
+                        let a = Math.atan2(player.y - boss.y, player.x - boss.x) + (Math.random()-0.5)*0.25;
+                        bullets.push({
+                            x: boss.x, y: boss.y,
+                            vx: Math.cos(a)*5.6, vy: Math.sin(a)*5.6,
+                            damage: Math.max(5, Math.floor(boss.damage)),
+                            size:7, type:'enemy', hitEnemies:[], isBoomerang:false, returning:false, returnedOnce:false, toRemove:false
+                        });
+                    }
+                    boss.attackTimer = 0;
+                } else if(boss.phase === 2 && boss.attackTimer > 3.2){
+                    // heavy slow shots
+                    for(let k=0;k<6;k++){
+                        let a = Math.random()*Math.PI*2;
+                        bullets.push({
+                            x: boss.x, y: boss.y,
+                            vx: Math.cos(a)*3.2, vy: Math.sin(a)*3.2,
+                            damage: Math.max(6, Math.floor(boss.damage*1.2)),
+                            size:9, type:'enemy', hitEnemies:[], isBoomerang:false, returning:false, returnedOnce:false, toRemove:false
+                        });
+                    }
+                    boss.attackTimer = 0;
+                }
+            } else {
+                // normal boss
+                let angle = Math.atan2(player.y-boss.y, player.x-boss.x);
+                boss.x += Math.cos(angle)*boss.speed + boss.vx;
+                boss.y += Math.sin(angle)*boss.speed + boss.vy;
+                boss.vx *= 0.8; boss.vy *= 0.8;
+
+                boss.attackTimer += dt;
+                if(boss.attackTimer > 2.2){
+                    for(let k=0;k<6;k++){
+                        let a = Math.random()*Math.PI*2;
+                        bullets.push({
+                            x: boss.x, y: boss.y,
+                            vx: Math.cos(a)*4.5, vy: Math.sin(a)*4.5,
+                            damage: Math.max(3, Math.floor(boss.damage)),
+                            size:6, type:'enemy', hitEnemies:[], isBoomerang:false, returning:false, returnedOnce:false, toRemove:false
+                        });
+                    }
+                    boss.attackTimer = 0;
+                }
+            }
+
+            // contact damage
+            if(distance(player,boss) < player.size + boss.size){
+                player.health -= boss.damage * 0.6;
+                if(player.health <= 0){
+                    player.health = 0;
+                    gameOver = true;
+                    showGameOverPanel();
+                    ctx.restore();
+                    return;
+                }
+            }
+
+            // draw boss
+            ctx.fillStyle = boss.flash>0 ? 'white' : boss.color;
+            ctx.beginPath();
+            ctx.arc(boss.x,boss.y,boss.size,0,Math.PI*2);
+            ctx.fill();
+            boss.flash = Math.max(0, boss.flash-1);
+
+            // boss health bar above boss
+            const hbW = boss.size*2;
+            ctx.fillStyle = 'rgba(200,0,0,0.9)';
+            ctx.fillRect(boss.x - boss.size, boss.y - boss.size - 12, hbW, 8);
+            ctx.fillStyle = boss.final ? 'red' : 'magenta';
+            ctx.fillRect(boss.x - boss.size, boss.y - boss.size - 12, hbW * Math.max(0, (boss.health / boss.maxHealth)), 8);
+        }
+    }
+
+    // ----- Draw player & HUD -----
+    ctx.fillStyle = player.color;
+    ctx.beginPath();
+    ctx.arc(player.x,player.y,player.size,0,Math.PI*2);
+    ctx.fill();
+
+    // player health bar top-left
+    ctx.fillStyle='gray';
+    ctx.fillRect(18,12,200,16);
+    ctx.fillStyle='lime';
+    ctx.fillRect(18,12,200 * Math.max(0, player.health / player.maxHealth),16);
+    ctx.fillStyle='white';
+    ctx.font='14px Arial';
+    ctx.fillText(`Health: ${Math.floor(player.health)}/${player.maxHealth}`, 30, 24);
+
+    // HUD level/exp
+    ctx.fillStyle='white';
+    ctx.font='16px Arial';
+    ctx.fillText(`Level: ${player.level}`, 18, 44);
+    ctx.fillText(`EXP: ${player.exp}/${maxExpCap}`, 18, 64);
+
+    // swarm text
+    if(swarmTextTimer > 0){
+        ctx.fillStyle = 'white';
+        ctx.font = '36px Arial';
+        ctx.fillText('SWARM MODE!', canvas.width/2 - 120, 100);
+        swarmTextTimer--;
+    }
+
+    // boss spawn timer for normal boss
+    if(!bossSpawned && !finalBossPhase && (Date.now() - lastBossTime)/1000 > 120){
+        spawnBoss(false);
+        swarmTextTimer = 60;
+    }
+
+    ctx.restore(); // restore after shake/draw
+
+    requestAnimationFrame(gameLoop);
+}
+
+/* --------------------------
+   GAME OVER & START
+   -------------------------- */
+function showGameOverPanel(){
+    createOverlay();
+    const existing = document.getElementById('gameOverPanel');
+    if(existing) existing.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'gameOverPanel';
+    panel.style.left = '50%';
+    panel.style.top = '50%';
+    panel.style.transform = 'translate(-50%,-50%)';
+    panel.style.zIndex = '6';
+    panel.style.color = 'white';
+    panel.style.textAlign = 'center';
+    panel.style.background = 'rgba(0,0,0,0.85)';
+    panel.style.padding = '24px';
+    panel.style.border = '2px solid #fff';
+    panel.style.borderRadius = '8px';
+
+    const title = document.createElement('div');
+    title.style.fontSize = '44px';
+    title.style.color = 'red';
+    title.style.marginBottom = '12px';
+    title.innerText = 'GAME OVER';
+    panel.appendChild(title);
+
+    const info = document.createElement('div');
+    info.style.marginBottom = '16px';
+    info.innerText = `You reached level ${player.level}`;
+    panel.appendChild(info);
+
+    const btn = document.createElement('button');
+    btn.innerText = 'Return to Main Menu';
+    btn.style.padding = '10px 20px';
+    btn.onclick = ()=> { location.reload(); };
+    panel.appendChild(btn);
+
+    document.body.appendChild(panel);
+}
+
+/* --------------------------
+   START BUTTON
+   -------------------------- */
+document.getElementById('startBtn').onclick = ()=> {
+    document.getElementById('menu').style.display = 'none';
+    // reset state
+    gameStarted = true;
+    gameOver = false;
+    elapsedSeconds = 0;
+    lastBossTime = Date.now();
+    spawnRate = 0.004;
+    speedMultiplier = 1;
+    healthMultiplier = 1;
+    enemies = [];
+    bullets = [];
+    particles = [];
+    explosions = [];
+    boss = null;
+    bossSpawned = false;
+    bossLevel = 1;
+    finalSequenceTriggered = false;
+    finalSequenceTimer = 0;
+    finalBossPhase = false;
+    finalTauntShown = false;
+    finalVictory = false;
+
+    // RESET CUTSCENE / DIALOGUE state so start doesn't hang
+    finalCutsceneActive = false;
+    finalDialogueIndex = 0;
+    finalDialogueTimer = 0;
+
+    levelUpMenu = false;
+    upgradePending = false;
+
+    player.x = canvas.width/2;
+    player.y = canvas.height/2;
+    player.health = player.maxHealth;
+    player.exp = 0;
+    player.level = 1;
+    prevTime = performance.now();
+    // clear overlays
+    const existing = document.getElementById('upgradeMenu');
+    if(existing) existing.remove();
+    const ov = document.getElementById('overlay');
+    if(ov) ov.remove();
+    gameLoop();
+};
+
+// handle window resize
+window.addEventListener('resize', () => {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+});
+</script>
+</body>
+</html>
